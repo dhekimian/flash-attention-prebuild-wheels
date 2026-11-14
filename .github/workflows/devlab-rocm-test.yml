@@ -167,7 +167,9 @@ jobs:
           echo "torch: $spec from $index"
           # Only the torch index: the host's pip.conf adds PyPI as an extra index,
           # and PyPI's CUDA torch can outrank the ROCm build.
-          PIP_CONFIG_FILE=/dev/null pip install -q "$spec" --index-url "$index"
+          # numpy with torch: the torch-alone probe imports it, and older torch
+          # wheels do not depend on it.
+          PIP_CONFIG_FILE=/dev/null pip install -q "$spec" numpy --index-url "$index"
           # Pin the torch stack for every later pip call: a package that depends on
           # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
           # and the tests run on the CPU.
@@ -229,7 +231,7 @@ jobs:
           set -euo pipefail
           . venv/bin/activate
           curl -fsSL -o "${{ steps.pick.outputs.name }}" "${{ steps.pick.outputs.url }}"
-          pip install -q "${{ steps.pick.outputs.name }}" pytest pytest-timeout einops numpy
+          pip install -q "${{ steps.pick.outputs.name }}" pytest pytest-timeout einops
           python - <<'PY'
           import json, torch, flash_attn
           # The wheel is CK-only. Without its compiled module flash_attn can fall
