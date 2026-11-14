@@ -86,6 +86,13 @@ jobs:
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
     steps:
+      - name: Get the known-failures list
+        uses: actions/checkout@v4
+        with:
+          path: devlab-config
+          sparse-checkout: .github/devlab-known-failures.txt
+          sparse-checkout-cone-mode: false
+
       - name: Write the test sampler
         run: |
           # A pytest plugin that keeps a deterministic sample at collection time:
@@ -300,14 +307,79 @@ jobs:
           PY
 
       - name: Upstream CK tests (deterministic sample)
+        id: ck
         if: steps.probe.outputs.torch_alone == 'ok'
         working-directory: fa
         run: |
           set -euo pipefail
           . ../venv/bin/activate
+          # Test failures do not fail this step; "Judge results" decides, so a
+          # known upstream failure is a warning and anything new is an error.
+          rc=0
           PYTHONPATH="$SAMPLER_DIR" DEVLAB_PER="$PER_FUNCTION" DEVLAB_GROUP=function \
             python -m pytest tests/test_flash_attn_ck.py -p devlab_sample -q -rf -p no:cacheprovider \
-            --timeout=600 --junitxml=../junit.xml
+            --timeout=600 --junitxml=../junit.xml || rc=$?
+          echo "pytest exit code: $rc"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Judge results
+        if: steps.ck.outcome == 'success'
+        env:
+          RC: ${{ steps.ck.outputs.rc }}
+        run: |
+          python3 - <<'PY'
+          import fnmatch, json, os, sys, xml.etree.ElementTree as ET
+          known = []
+          path = "devlab-config/.github/devlab-known-failures.txt"
+          if os.path.exists(path):
+              for line in open(path):
+                  line = line.strip()
+                  if line and not line.startswith("#"):
+                      pat, reason, issue = ([x.strip() for x in line.split("|")] + ["", ""])[:3]
+                      # [ ] are literal (pytest parameter brackets); * and ? are globs.
+                      pat = "".join({"[": "[[]", "]": "[]]"}.get(c, c) for c in pat)
+                      known.append((pat, reason, issue or "not filed"))
+          def nodeid(cls, name):
+              # junit classname "tests.test_x" or "tests.test_x.TestC" -> pytest node id
+              parts = cls.split(".")
+              for i in range(len(parts), 0, -1):
+                  f = "/".join(parts[:i]) + ".py"
+                  if os.path.exists(os.path.join("fa", f)):
+                      return "::".join([f, *parts[i:], name])
+              return f"{cls}::{name}"
+          rc = int(os.environ.get("RC") or -1)
+          bad = []
+          if not os.path.exists("junit.xml"):
+              bad.append(f"no junit.xml (pytest exit {rc}): the tests did not run")
+          failed = []
+          if not bad:
+              for tc in ET.parse("junit.xml").getroot().iter("testcase"):
+                  if tc.find("failure") is not None or tc.find("error") is not None:
+                      failed.append(nodeid(tc.get("classname", ""), tc.get("name", "")))
+          # pytest: 0 all passed, 1 some tests failed; anything else means it broke.
+          if rc not in (0, 1):
+              bad.append(f"pytest exit {rc}: interrupted, internal or collection error")
+          if rc == 1 and not failed:
+              bad.append("pytest exit 1 but junit lists no failures")
+          known_ids, new_ids = [], []
+          out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          for fid in failed:
+              hit = next((k for k in known if fnmatch.fnmatchcase(fid, k[0])), None)
+              if hit:
+                  known_ids.append(fid)
+                  print(f"::warning title=Known upstream failure::{fid} — {hit[1]} ({hit[2]})")
+                  out.write(f"- known upstream failure: `{fid}` — {hit[1]} ({hit[2]})\n")
+              else:
+                  new_ids.append(fid)
+                  print(f"::error title=New failure::{fid}")
+                  out.write(f"- **new failure**: `{fid}`\n")
+          for b in bad:
+              print(f"::error::{b}")
+          json.dump({"known_failures": known_ids, "new_failures": new_ids, "problems": bad},
+                    open("judge.json", "w"))
+          print(f"failed: {len(failed)} (known {len(known_ids)}, new {len(new_ids)})")
+          sys.exit(1 if new_ids or bad else 0)
+          PY
 
       - name: Write the run summary
         if: always()
@@ -328,6 +400,7 @@ jobs:
                        "skipped": n["skipped"],
                        "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
                        "seconds": round(float(s.get("time", 0)), 1)}
+          judge = load("judge.json") or {}
           probe = load("probe.json") or {}
           torch_alone = probe.get("result")          # ok | crash | error | None (not reached)
           smoke = load("smoke.json") or {}
@@ -340,7 +413,7 @@ jobs:
           elif torch_alone == "error":
               verdict = "torch-error"                # e.g. not a ROCm build, wrong chip
           elif "${{ job.status }}" == "success":
-              verdict = "pass"
+              verdict = "known-failures" if judge.get("known_failures") else "pass"
           else:
               verdict = "fail"
           summary = {
@@ -349,7 +422,8 @@ jobs:
               "combo": "rocm${{ steps.pick.outputs.rocm }}torch${{ steps.pick.outputs.torch }}",
               "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
               "gfx": "${{ matrix.gfx }}", "env": load("env.json") or load("probe-env.json"), "smoke": smoke or None,
-              "tests": tests, "verdict": verdict, "job_status": "${{ job.status }}",
+              "tests": tests, "verdict": verdict,
+              "known_failures": judge.get("known_failures", []), "new_failures": judge.get("new_failures", []), "job_status": "${{ job.status }}",
               "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
           }

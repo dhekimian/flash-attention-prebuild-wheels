@@ -1,0 +1,10 @@
+# Known upstream failures for the DevLab ROCm wheel tests (devlab-rocm-test.yml).
+# A failed or errored test whose id matches a pattern here is reported as a
+# warning instead of failing the job. List a failure only after it has been
+# classified as upstream (not a problem in this workflow or the runners).
+#
+# <pattern> | <reason, one line> | <upstream issue URL, or "not filed">
+# <pattern> is an fnmatch glob on the pytest node id (* and ?; [ ] are literal), e.g.
+#   tests/test_flash_attn_ck.py::test_flash_attn_output[*-gfx1151*]
+#
+# None so far: every sampled CK test passes on gfx1151 and gfx1201.
