@@ -1,0 +1,29 @@
+# DevLab ROCm-next canary: the newest released wheel on torch built against
+# AMD's next ROCm (TheRock pre-release index), on Strix Halo and the R9700.
+# Nightly, in the DevLab fork only. A failure here that the release gate does
+# not show is an early warning about the next ROCm, not about this project.
+name: DevLab ROCm-next canary
+
+on:
+  schedule:
+    - cron: "41 10 * * *"       # daily 10:41 UTC
+  workflow_dispatch:
+    inputs:
+      torch_spec:
+        description: torch requirement from the TheRock pre-release index
+        default: "torch[device-{gfx}]==2.15.*"
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    uses: ./.github/workflows/devlab-rocm-test.yml
+    with:
+      release_tag: latest
+      tests_per_function: "30"
+      torch_spec: ${{ inputs.torch_spec || 'torch[device-{gfx}]==2.15.*' }}
+      # TheRock's pre-release (rc) index; torch pages redirect to
+      # /rocm/pytorch/whl-next/. {gfx} picks each job's chip package.
+      torch_index_url: https://rc.repo.amd.com/rocm/whl-next/
+      label: canary

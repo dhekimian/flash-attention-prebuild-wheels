@@ -1,0 +1,248 @@
+# Run the published ROCm wheels on real consumer AMD GPUs.
+#
+# The ROCm wheels are built for gfx90a..gfx1201, but the build runners have no
+# AMD GPU, so CI only checks `import flash_attn` (PR #160: gfx1151/gfx1201
+# "have not been exercised on hardware"). This job installs a released wheel on
+# a Radeon 8060S (Strix Halo, gfx1151) and a Radeon AI PRO R9700 (gfx1201) and
+# runs a sample of upstream flash-attention's own CK tests at the wheel's commit.
+#
+# Every run uploads summary-<gpu>.json (versions, device, pass/fail counts) so
+# results compare across releases. Other workflows call this one for a version
+# matrix (workflow_call).
+#
+# Runners: AMD DevLab, a donated pool of ephemeral, single-use machines. One
+# job per machine; nothing persists between jobs.
+name: ROCm wheel test (gfx1151, gfx1201)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release to test (a tag, or "latest")
+        default: latest
+      combo:
+        description: Wheel to pick, e.g. rocm7.1torch2.12 (empty = newest in the release)
+        default: ""
+      tests_per_function:
+        description: Upstream CK test cases to run per test function
+        default: "30"
+  workflow_call:
+    inputs:
+      release_tag: {type: string, default: latest}
+      combo: {type: string, default: ""}
+      tests_per_function: {type: string, default: "30"}
+      torch_spec:
+        description: Override the torch requirement; {gfx} becomes the job's chip
+        type: string
+        default: ""
+      torch_index_url:
+        description: Override the index torch comes from
+        type: string
+        default: ""
+      label:
+        description: Names the summary artifact (e.g. matrix, canary)
+        type: string
+        default: release
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.gpu }} (${{ matrix.gfx }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gpu: strix-halo
+            gfx: gfx1151
+          - gpu: radeon-r9700
+            gfx: gfx1201
+    runs-on: [self-hosted, Linux, devlab-dispatch, "${{ matrix.gpu }}"]
+    timeout-minutes: 75
+    env:
+      # Releases live in the upstream repo; a fork testing this workflow can
+      # point at them with a repository variable.
+      WHEEL_REPO: ${{ vars.WHEEL_REPO || github.repository }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || 'latest' }}
+      COMBO: ${{ inputs.combo || '' }}
+      PER_FUNCTION: ${{ inputs.tests_per_function || '30' }}
+      TORCH_SPEC: ${{ inputs.torch_spec || '' }}
+      TORCH_INDEX_URL: ${{ inputs.torch_index_url || '' }}
+      # Where torch's ROCm wheels come from by default; a runner pool with a
+      # mirror can set TORCH_INDEX_BASE.
+      TORCH_INDEX_BASE: ${{ vars.TORCH_INDEX_BASE || 'https://download.pytorch.org/whl' }}
+      LABEL: ${{ inputs.label || 'release' }}
+    steps:
+      - name: Pick the wheel for this machine's Python
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          py=$(python3 -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')
+          api="https://api.github.com/repos/$WHEEL_REPO/releases"
+          if [ "$RELEASE_TAG" = latest ]; then url="$api/latest"; else url="$api/tags/$RELEASE_TAG"; fi
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$url" > release.json
+          python3 - "$py" "$COMBO" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, re, sys
+          py, combo = sys.argv[1], sys.argv[2]
+          rel = json.load(open("release.json"))
+          pat = re.compile(r"^flash_attn-(?P<fa>[\d.]+)\+rocm(?P<rocm>[\d.]+)torch(?P<torch>[\d.]+)"
+                           r"(?:git(?P<git>[0-9a-f]+))?-" + py + "-" + py + r"-linux_x86_64\.whl$")
+          cands = []
+          for a in rel["assets"]:
+              m = pat.match(a["name"])
+              if m and (not combo or f"rocm{m['rocm']}torch{m['torch']}" == combo):
+                  key = (tuple(map(int, m["torch"].split("."))), tuple(map(int, m["rocm"].split("."))))
+                  cands.append((key, a, m))
+          if not cands:
+              sys.exit(f"no ROCm wheel for {py} {combo or ''} in {rel['tag_name']}")
+          _, a, m = max(cands, key=lambda c: c[0])
+          for k, v in {"tag": rel["tag_name"], "name": a["name"], "url": a["browser_download_url"],
+                       "fa": m["fa"], "rocm": m["rocm"], "torch": m["torch"], "git": m["git"] or "",
+                       "py": py}.items():
+              print(f"{k}={v}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Install torch and the wheel
+        run: |
+          set -euo pipefail
+          python3 -m venv venv
+          . venv/bin/activate
+          pip install -q --upgrade pip
+          spec="${TORCH_SPEC:-torch==${{ steps.pick.outputs.torch }}.*}"
+          spec="${spec//\{gfx\}/${{ matrix.gfx }}}"     # e.g. torch[device-{gfx}] for TheRock
+          index="${TORCH_INDEX_URL:-$TORCH_INDEX_BASE/rocm${{ steps.pick.outputs.rocm }}}"
+          echo "torch: $spec from $index"
+          pip install -q "$spec" --index-url "$index"
+          curl -fsSL -o "${{ steps.pick.outputs.name }}" "${{ steps.pick.outputs.url }}"
+          pip install -q "${{ steps.pick.outputs.name }}" pytest pytest-timeout einops
+          python - <<'PY'
+          import json, torch, flash_attn
+          # The wheel is CK-only. Without its compiled module flash_attn can fall
+          # back to Triton and this job would test something else.
+          import flash_attn_2_cuda  # noqa: F401
+          p = torch.cuda.get_device_properties(0)
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName, "flash_attn": flash_attn.__version__}
+          print(info)
+          json.dump(info, open("env.json", "w"))
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          PY
+
+      - name: Fetch upstream tests at the wheel's commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ref="${{ steps.pick.outputs.git }}"
+          if [ -n "$ref" ]; then
+            ref=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/Dao-AILab/flash-attention/commits/$ref" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')
+          else
+            ref="v${{ steps.pick.outputs.fa }}"
+          fi
+          git init -q fa && cd fa
+          git remote add origin https://github.com/Dao-AILab/flash-attention.git
+          git fetch -q --depth 1 origin "$ref"
+          git checkout -q FETCH_HEAD -- tests
+          echo "tests from $ref"
+
+      - name: Smoke test against PyTorch attention
+        run: |
+          . venv/bin/activate
+          python - <<'PY'
+          import json, torch, torch.nn.functional as F
+          from flash_attn import flash_attn_func
+          torch.manual_seed(0)
+          passed = failed = 0
+          for dtype in (torch.float16, torch.bfloat16):
+              for (b, s, h, d) in [(2, 128, 8, 64), (1, 1024, 16, 128), (4, 333, 4, 96)]:
+                  for causal in (False, True):
+                      q, k, v = (torch.randn(b, s, h, d, device="cuda", dtype=dtype, requires_grad=True)
+                                 for _ in range(3))
+                      out = flash_attn_func(q, k, v, causal=causal)
+                      ref = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                                           v.transpose(1, 2), is_causal=causal).transpose(1, 2)
+                      err = (out - ref).abs().max().item()
+                      out.sum().backward()
+                      ok = err < (2e-2 if dtype == torch.bfloat16 else 5e-3) and bool(torch.isfinite(q.grad).all())
+                      passed += ok
+                      failed += not ok
+                      print(f"{'ok  ' if ok else 'FAIL'} {dtype} b{b} s{s} h{h} d{d} causal={causal} max|err|={err:.2e}")
+          json.dump({"passed": passed, "failed": failed}, open("smoke.json", "w"))
+          raise SystemExit(failed)
+          PY
+
+      - name: Upstream CK tests (deterministic sample)
+        working-directory: fa
+        run: |
+          set -euo pipefail
+          . ../venv/bin/activate
+          python -m pytest tests/test_flash_attn_ck.py --collect-only -q 2>/dev/null \
+            | grep '::' > all-tests.txt
+          python - "$PER_FUNCTION" <<'PY' > sample.txt
+          import sys
+          from collections import defaultdict
+          per = int(sys.argv[1])
+          by_fn = defaultdict(list)
+          for line in open("all-tests.txt"):
+              node = line.strip()
+              # Collected ids are relative to tests/'s rootdir; run from the repo root.
+              if not node.startswith("tests/"):
+                  node = "tests/" + node
+              by_fn[node.split("[")[0]].append(node)
+          for fn, nodes in sorted(by_fn.items()):
+              step = max(1, len(nodes) // per)
+              for n in nodes[::step][:per]:
+                  print(n)
+          PY
+          echo "running $(wc -l < sample.txt) of $(wc -l < all-tests.txt) collected cases"
+          python -m pytest -q -rf -p no:cacheprovider --timeout=600 \
+            --junitxml=../junit.xml $(cat sample.txt)
+
+      - name: Write the run summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime, xml.etree.ElementTree as ET
+          def load(p):
+              try:
+                  return json.load(open(p))
+              except Exception:
+                  return None
+          tests = None
+          if os.path.exists("junit.xml"):
+              s = ET.parse("junit.xml").getroot()
+              s = s if s.tag == "testsuite" else s.find("testsuite")
+              n = {k: int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+              tests = {"ran": n["tests"], "failed": n["failures"], "errors": n["errors"],
+                       "skipped": n["skipped"],
+                       "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
+                       "seconds": round(float(s.get("time", 0)), 1)}
+          summary = {
+              "schema": 1, "project": "flash-attention-prebuild-wheels", "label": os.environ["LABEL"],
+              "release": "${{ steps.pick.outputs.tag }}", "wheel": "${{ steps.pick.outputs.name }}",
+              "combo": "rocm${{ steps.pick.outputs.rocm }}torch${{ steps.pick.outputs.torch }}",
+              "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
+              "gfx": "${{ matrix.gfx }}", "env": load("env.json"), "smoke": load("smoke.json"),
+              "tests": tests, "job_status": "${{ job.status }}",
+              "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+          }
+          json.dump(summary, open("summary.json", "w"), indent=1)
+          print(json.dumps(summary, indent=1))
+          PY
+
+      - name: Upload the run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devlab-summary-${{ inputs.label || 'release' }}-${{ steps.pick.outputs.tag || 'unknown' }}-rocm${{ steps.pick.outputs.rocm }}torch${{ steps.pick.outputs.torch }}-${{ matrix.gpu }}
+          path: summary.json
+          retention-days: 90

@@ -1,0 +1,36 @@
+# DevLab support matrix: every ROCm/torch combination this project has shipped,
+# on Strix Halo (gfx1151) and the R9700 (gfx1201). Weekly, in the DevLab fork
+# only -- it is the compatibility baseline, not something the project needs to
+# run. Each cell uploads summary-*.json (see devlab-rocm-test.yml).
+#
+# The list is (release, combo): the newest release that shipped each
+# combination. Update it when a release adds a new ROCm or torch.
+name: DevLab support matrix
+
+on:
+  schedule:
+    - cron: "17 9 * * 1"        # Mondays 09:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - {release: v1.7.0, combo: rocm7.14torch2.15}
+          - {release: v1.0.0, combo: rocm7.2torch2.14}
+          - {release: v1.1.0, combo: rocm7.1torch2.13}
+          - {release: v1.2.0, combo: rocm7.1torch2.12}
+          - {release: v1.3.0, combo: rocm7.1torch2.11}
+          - {release: v1.4.0, combo: rocm7.0torch2.10}
+    uses: ./.github/workflows/devlab-rocm-test.yml
+    with:
+      release_tag: ${{ matrix.release }}
+      combo: ${{ matrix.combo }}
+      tests_per_function: "30"
+      label: matrix
