@@ -167,7 +167,7 @@ jobs:
           export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
           echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
           curl -fsSL -o "${{ steps.pick.outputs.name }}" "${{ steps.pick.outputs.url }}"
-          pip install -q "${{ steps.pick.outputs.name }}" pytest pytest-timeout einops
+          pip install -q "${{ steps.pick.outputs.name }}" pytest pytest-timeout einops numpy
           python - <<'PY'
           import json, torch, flash_attn
           # The wheel is CK-only. Without its compiled module flash_attn can fall
@@ -203,8 +203,15 @@ jobs:
       - name: Smoke test against PyTorch attention
         run: |
           . venv/bin/activate
-          python - <<'PY'
-          import json, torch, torch.nn.functional as F
+          python -u - <<'PY'
+          import faulthandler, json, torch, torch.nn.functional as F
+          faulthandler.enable()
+          # torch alone first: a crash here is the torch build on this GPU, not the wheel.
+          x = torch.randn(256, 256, device="cuda", dtype=torch.float16)
+          (x @ x).float().sum().item()
+          y = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16)
+          F.scaled_dot_product_attention(y, y, y).float().sum().item()
+          print("torch alone: matmul and SDPA ok")
           from flash_attn import flash_attn_func
           torch.manual_seed(0)
           passed = failed = 0
