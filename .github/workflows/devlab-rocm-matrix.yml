@@ -5,6 +5,12 @@
 #
 # The list is (release, combo): the newest release that shipped each
 # combination. Update it when a release adds a new ROCm or torch.
+#
+# expect_torch_crash names chips where that combo's torch build crashes on its
+# own, before flash_attn is imported (PyTorch's rocm7.0/7.1 builds segfault on
+# gfx1151 at the first GPU op). Those cells pass with a warning and record
+# verdict "torch-unsupported-expected" in summary.json; if torch starts working
+# there, the wheel is tested as usual and a notice says to drop the entry.
 name: DevLab support matrix
 
 on:
@@ -24,13 +30,14 @@ jobs:
         include:
           - {release: v1.7.0, combo: rocm7.14torch2.15}
           - {release: v1.0.0, combo: rocm7.2torch2.14}
-          - {release: v1.1.0, combo: rocm7.1torch2.13}
-          - {release: v1.2.0, combo: rocm7.1torch2.12}
-          - {release: v1.3.0, combo: rocm7.1torch2.11}
-          - {release: v1.4.0, combo: rocm7.0torch2.10}
+          - {release: v1.1.0, combo: rocm7.1torch2.13, expect_torch_crash: gfx1151}
+          - {release: v1.2.0, combo: rocm7.1torch2.12, expect_torch_crash: gfx1151}
+          - {release: v1.3.0, combo: rocm7.1torch2.11, expect_torch_crash: gfx1151}
+          - {release: v1.4.0, combo: rocm7.0torch2.10, expect_torch_crash: gfx1151}
     uses: ./.github/workflows/devlab-rocm-test.yml
     with:
       release_tag: ${{ matrix.release }}
       combo: ${{ matrix.combo }}
+      expect_torch_crash: ${{ matrix.expect_torch_crash || '' }}
       tests_per_function: "30"
       label: matrix

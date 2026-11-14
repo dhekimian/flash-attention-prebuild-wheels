@@ -45,6 +45,13 @@ on:
         description: Names the summary artifact (e.g. matrix, canary)
         type: string
         default: release
+      expect_torch_crash:
+        description: >-
+          Chips (e.g. "gfx1151") where this torch build is known to crash on its
+          own. There a crash is recorded as torch-unsupported and the wheel steps
+          are skipped; anywhere else a torch crash fails the job.
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -75,6 +82,7 @@ jobs:
       # mirror can set TORCH_INDEX_BASE.
       TORCH_INDEX_BASE: ${{ vars.TORCH_INDEX_BASE || 'https://download.pytorch.org/whl' }}
       LABEL: ${{ inputs.label || 'release' }}
+      EXPECT_TORCH_CRASH: ${{ inputs.expect_torch_crash || '' }}
       TORCH_INDEX_MAP: ${{ vars.TORCH_INDEX_MAP }}
       SAMPLER_DIR: ${{ github.workspace }}/../devlab-sampler
     steps:
@@ -138,7 +146,7 @@ jobs:
           PY
           cat "$GITHUB_OUTPUT"
 
-      - name: Install torch and the wheel
+      - name: Install torch
         run: |
           set -euo pipefail
           python3 -m venv venv
@@ -157,7 +165,9 @@ jobs:
           fi
           index="$INDEX"
           echo "torch: $spec from $index"
-          pip install -q "$spec" --index-url "$index"
+          # Only the torch index: the host's pip.conf adds PyPI as an extra index,
+          # and PyPI's CUDA torch can outrank the ROCm build.
+          PIP_CONFIG_FILE=/dev/null pip install -q "$spec" --index-url "$index"
           # Pin the torch stack for every later pip call: a package that depends on
           # torch can otherwise replace the ROCm build with a CUDA wheel from PyPI,
           # and the tests run on the CPU.
@@ -166,6 +176,58 @@ jobs:
           cat "$RUNNER_TEMP/torch-pin.txt"
           export PIP_CONSTRAINT="$RUNNER_TEMP/torch-pin.txt"
           echo "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
+
+      - name: Probe torch alone on this GPU
+        id: probe
+        run: |
+          # Before any flash_attn code: if torch itself crashes on this chip, the
+          # result is about the torch build, not the wheel. Some torch builds
+          # segfault on gfx1151 at the first GPU op.
+          . venv/bin/activate
+          set +e
+          python -u - <<'PY'
+          import faulthandler, json, torch, torch.nn.functional as F
+          faulthandler.enable()
+          p = torch.cuda.get_device_properties(0)
+          info = {"torch": torch.__version__, "hip": torch.version.hip, "device": p.name,
+                  "arch": p.gcnArchName}
+          print(info, flush=True)
+          json.dump(info, open("probe-env.json", "w"))
+          assert torch.version.hip, "torch is not a ROCm build"
+          assert "${{ matrix.gfx }}" in p.gcnArchName, f"expected ${{ matrix.gfx }}, got {p.gcnArchName}"
+          x = torch.randn(256, 256, device="cuda", dtype=torch.float16)
+          (x @ x).float().sum().item()
+          y = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16)
+          F.scaled_dot_product_attention(y, y, y).float().sum().item()
+          print("torch alone: matmul and SDPA ok")
+          PY
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then result=ok
+          elif [ "$rc" -gt 128 ]; then result=crash     # killed by a signal (139 = SIGSEGV)
+          else result=error; fi
+          expected=false
+          case " ${EXPECT_TORCH_CRASH//,/ } " in *" ${{ matrix.gfx }} "*) expected=true ;; esac
+          printf '{"result": "%s", "exit": %d, "expected_crash": %s}\n' "$result" "$rc" "$expected" > probe.json
+          cat probe.json
+          echo "torch_alone=$result" >> "$GITHUB_OUTPUT"
+          if [ "$result" = ok ]; then
+            [ "$expected" = false ] || echo "::notice::torch alone works on ${{ matrix.gfx }} now; drop it from expect_torch_crash"
+            exit 0
+          fi
+          msg="torch alone fails on ${{ matrix.gfx }} (exit $rc): this torch build does not run on this chip; flash_attn was not tested"
+          if [ "$result" = crash ] && [ "$expected" = true ]; then
+            echo "::warning::$msg (expected: expect_torch_crash)"
+            exit 0
+          fi
+          echo "::error::$msg"
+          exit 1
+
+      - name: Install the wheel
+        if: steps.probe.outputs.torch_alone == 'ok'
+        run: |
+          set -euo pipefail
+          . venv/bin/activate
           curl -fsSL -o "${{ steps.pick.outputs.name }}" "${{ steps.pick.outputs.url }}"
           pip install -q "${{ steps.pick.outputs.name }}" pytest pytest-timeout einops numpy
           python - <<'PY'
@@ -182,6 +244,7 @@ jobs:
           PY
 
       - name: Fetch upstream tests at the wheel's commit
+        if: steps.probe.outputs.torch_alone == 'ok'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -201,17 +264,12 @@ jobs:
           echo "tests from $ref"
 
       - name: Smoke test against PyTorch attention
+        if: steps.probe.outputs.torch_alone == 'ok'
         run: |
           . venv/bin/activate
           python -u - <<'PY'
           import faulthandler, json, torch, torch.nn.functional as F
           faulthandler.enable()
-          # torch alone first: a crash here is the torch build on this GPU, not the wheel.
-          x = torch.randn(256, 256, device="cuda", dtype=torch.float16)
-          (x @ x).float().sum().item()
-          y = torch.randn(1, 4, 128, 64, device="cuda", dtype=torch.float16)
-          F.scaled_dot_product_attention(y, y, y).float().sum().item()
-          print("torch alone: matmul and SDPA ok")
           from flash_attn import flash_attn_func
           torch.manual_seed(0)
           passed = failed = 0
@@ -234,6 +292,7 @@ jobs:
           PY
 
       - name: Upstream CK tests (deterministic sample)
+        if: steps.probe.outputs.torch_alone == 'ok'
         working-directory: fa
         run: |
           set -euo pipefail
@@ -261,13 +320,28 @@ jobs:
                        "skipped": n["skipped"],
                        "passed": n["tests"] - n["failures"] - n["errors"] - n["skipped"],
                        "seconds": round(float(s.get("time", 0)), 1)}
+          probe = load("probe.json") or {}
+          torch_alone = probe.get("result")          # ok | crash | error | None (not reached)
+          smoke = load("smoke.json") or {}
+          if torch_alone:
+              smoke = {"torch_alone": torch_alone, **smoke}
+          # One word per cell for the compatibility table. torch-unsupported means
+          # the torch build itself does not run on this chip: no wheel verdict.
+          if torch_alone == "crash":
+              verdict = "torch-unsupported" + ("-expected" if probe.get("expected_crash") else "")
+          elif torch_alone == "error":
+              verdict = "torch-error"                # e.g. not a ROCm build, wrong chip
+          elif "${{ job.status }}" == "success":
+              verdict = "pass"
+          else:
+              verdict = "fail"
           summary = {
               "schema": 1, "project": "flash-attention-prebuild-wheels", "label": os.environ["LABEL"],
               "release": "${{ steps.pick.outputs.tag }}", "wheel": "${{ steps.pick.outputs.name }}",
               "combo": "rocm${{ steps.pick.outputs.rocm }}torch${{ steps.pick.outputs.torch }}",
               "torch_spec": os.environ.get("TORCH_SPEC", ""), "gpu": "${{ matrix.gpu }}",
-              "gfx": "${{ matrix.gfx }}", "env": load("env.json"), "smoke": load("smoke.json"),
-              "tests": tests, "job_status": "${{ job.status }}",
+              "gfx": "${{ matrix.gfx }}", "env": load("env.json") or load("probe-env.json"), "smoke": smoke or None,
+              "tests": tests, "verdict": verdict, "job_status": "${{ job.status }}",
               "run": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
               "finished": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
           }
